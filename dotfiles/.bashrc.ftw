@@ -473,6 +473,28 @@ function _gwt_name_for_worktree_path {
     basename "$wt_path"
 }
 
+# Helper: check if a worktree path is under the canonical directory.
+function _gwt_is_canonical_worktree_path {
+    local wt_path=$1
+    local wt_dir=$(_gwt_worktrees_dir)
+    [[ -n "$wt_path" && -n "$wt_dir" && "$wt_path" == "$wt_dir/"* ]]
+}
+
+# Helper: print a warning when a registered worktree is outside the canonical
+# location. This keeps legacy worktrees usable while making drift visible.
+function _gwt_warn_if_noncanonical_worktree {
+    local name=$1
+    local wt_path=$2
+    local wt_dir=$(_gwt_worktrees_dir)
+    [[ -z "$name" || -z "$wt_path" || -z "$wt_dir" ]] && return 0
+
+    if ! _gwt_is_canonical_worktree_path "$wt_path"; then
+        echo "Warning: Worktree '$name' is outside the canonical location." >&2
+        echo "  Current:   $wt_path" >&2
+        echo "  Canonical: $wt_dir/$name" >&2
+    fi
+}
+
 # Helper: list gwt names for all registered non-main worktrees.
 function _gwt_list_worktree_names {
     local main=$(_gwt_main_worktree)
@@ -621,6 +643,7 @@ function gwt {
         local target
         target=$(_gwt_resolve_worktree_path "$1")
         if [[ -n "$target" && -d "$target" ]]; then
+            _gwt_warn_if_noncanonical_worktree "$1" "$target"
             cd "$target"
         else
             echo "Error: Worktree '$1' not found."
@@ -660,6 +683,7 @@ function gwt-cd {
         return 1
     fi
 
+    _gwt_warn_if_noncanonical_worktree "$1" "$target"
     cd "$target"
 }
 
@@ -715,15 +739,44 @@ function gwt-ls {
 
     # Get worktree list and highlight current directory
     local current_path="$PWD"
-    git -C "$main" worktree list | while IFS= read -r line; do
-        # Extract the path (first field)
-        local wt_path="${line%% *}"
-        if [[ "$current_path" == "$wt_path"* ]]; then
-            echo "* $line"
-        else
-            echo "  $line"
+    local wt_path=""
+    local wt_branch=""
+    local wt_name=""
+    local wt_line=""
+    local prefix=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == worktree\ * ]]; then
+            if [[ -n "$wt_path" ]]; then
+                prefix="  "
+                if [[ "$current_path" == "$wt_path"* ]]; then
+                    prefix="* "
+                fi
+                echo "${prefix}${wt_line}"
+                if [[ "$wt_path" != "$main" ]]; then
+                    wt_name=$(_gwt_name_for_worktree_path "$wt_path" "$wt_branch")
+                    _gwt_warn_if_noncanonical_worktree "$wt_name" "$wt_path"
+                fi
+            fi
+            wt_path=${line#worktree }
+            wt_branch=""
+            wt_line=$(git -c color.ui=false -C "$main" worktree list | grep --color=never -F "$wt_path " | head -1)
+        elif [[ "$line" == branch\ refs/heads/* ]]; then
+            wt_branch=${line#branch refs/heads/}
         fi
-    done
+    done < <(git --no-pager -C "$main" worktree list --porcelain 2>/dev/null)
+
+    if [[ -n "$wt_path" ]]; then
+        prefix="  "
+        if [[ "$current_path" == "$wt_path"* ]]; then
+            prefix="* "
+        fi
+        echo "${prefix}${wt_line}"
+        if [[ "$wt_path" != "$main" ]]; then
+            wt_name=$(_gwt_name_for_worktree_path "$wt_path" "$wt_branch")
+            _gwt_warn_if_noncanonical_worktree "$wt_name" "$wt_path"
+        fi
+    fi
 }
 
 # Remove a worktree
