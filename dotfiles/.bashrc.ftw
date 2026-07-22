@@ -447,6 +447,95 @@ function _gwt_worktrees_dir {
     echo "$(dirname "$main")/.worktrees/$(basename "$main")"
 }
 
+# Helper: convert a registered worktree path into its gwt name.
+# Canonical worktrees use the path relative to $wt_dir; legacy/off-standard
+# worktrees fall back to their branch name so old locations still work.
+function _gwt_name_for_worktree_path {
+    local wt_path=$1
+    local wt_branch=$2
+    local main=$(_gwt_main_worktree)
+    local wt_dir=$(_gwt_worktrees_dir)
+
+    if [[ -z "$wt_path" || "$wt_path" == "$main" ]]; then
+        return 1
+    fi
+
+    if [[ -n "$wt_dir" && "$wt_path" == "$wt_dir/"* ]]; then
+        echo "${wt_path#$wt_dir/}"
+        return 0
+    fi
+
+    if [[ -n "$wt_branch" ]]; then
+        echo "$wt_branch"
+        return 0
+    fi
+
+    basename "$wt_path"
+}
+
+# Helper: list gwt names for all registered non-main worktrees.
+function _gwt_list_worktree_names {
+    local main=$(_gwt_main_worktree)
+    [[ -z "$main" ]] && return 1
+
+    local wt_path=""
+    local wt_branch=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == worktree\ * ]]; then
+            if [[ -n "$wt_path" && "$wt_path" != "$main" ]]; then
+                _gwt_name_for_worktree_path "$wt_path" "$wt_branch"
+            fi
+            wt_path=${line#worktree }
+            wt_branch=""
+        elif [[ "$line" == branch\ refs/heads/* ]]; then
+            wt_branch=${line#branch refs/heads/}
+        fi
+    done < <(git --no-pager -C "$main" worktree list --porcelain 2>/dev/null)
+
+    if [[ -n "$wt_path" && "$wt_path" != "$main" ]]; then
+        _gwt_name_for_worktree_path "$wt_path" "$wt_branch"
+    fi
+}
+
+# Helper: resolve a gwt name to its registered path, regardless of whether the
+# worktree lives in the canonical directory or an older legacy location.
+function _gwt_resolve_worktree_path {
+    local name=$1
+    local main=$(_gwt_main_worktree)
+    [[ -z "$name" || -z "$main" ]] && return 1
+
+    local wt_path=""
+    local wt_branch=""
+    local wt_name=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == worktree\ * ]]; then
+            if [[ -n "$wt_path" && "$wt_path" != "$main" ]]; then
+                wt_name=$(_gwt_name_for_worktree_path "$wt_path" "$wt_branch")
+                if [[ "$wt_name" == "$name" ]]; then
+                    echo "$wt_path"
+                    return 0
+                fi
+            fi
+            wt_path=${line#worktree }
+            wt_branch=""
+        elif [[ "$line" == branch\ refs/heads/* ]]; then
+            wt_branch=${line#branch refs/heads/}
+        fi
+    done < <(git --no-pager -C "$main" worktree list --porcelain 2>/dev/null)
+
+    if [[ -n "$wt_path" && "$wt_path" != "$main" ]]; then
+        wt_name=$(_gwt_name_for_worktree_path "$wt_path" "$wt_branch")
+        if [[ "$wt_name" == "$name" ]]; then
+            echo "$wt_path"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 # Helper: detect project name (repo directory name)
 function _gwt_detect_project {
     local main=$(_gwt_main_worktree)
@@ -471,18 +560,32 @@ function _gwt_is_protected_branch {
 }
 
 # Helper: detect current worktree name (returns empty if in main repo)
-# Handles slash-containing names like feat/terraform-state-backend
+# Handles slash-containing names like feat/terraform-state-backend and legacy
+# worktrees that are registered with git but live outside the canonical wt_dir.
 function _gwt_detect_worktree {
-    local wt_dir=$(_gwt_worktrees_dir)
-    [[ -z "$wt_dir" ]] && return 1
-
+    local main=$(_gwt_main_worktree)
     local toplevel
     toplevel=$(git rev-parse --show-toplevel 2>/dev/null)
-    [[ -z "$toplevel" ]] && return 1
+    [[ -z "$main" || -z "$toplevel" || "$toplevel" == "$main" ]] && return 1
 
-    # If the toplevel is under the worktrees dir, extract the relative name
-    if [[ "$toplevel" == "$wt_dir/"* ]]; then
-        echo "${toplevel#$wt_dir/}"
+    local wt_path=""
+    local wt_branch=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == worktree\ * ]]; then
+            if [[ -n "$wt_path" && "$wt_path" == "$toplevel" ]]; then
+                _gwt_name_for_worktree_path "$wt_path" "$wt_branch"
+                return 0
+            fi
+            wt_path=${line#worktree }
+            wt_branch=""
+        elif [[ "$line" == branch\ refs/heads/* ]]; then
+            wt_branch=${line#branch refs/heads/}
+        fi
+    done < <(git --no-pager -C "$main" worktree list --porcelain 2>/dev/null)
+
+    if [[ -n "$wt_path" && "$wt_path" == "$toplevel" ]]; then
+        _gwt_name_for_worktree_path "$wt_path" "$wt_branch"
         return 0
     fi
 
@@ -515,12 +618,13 @@ function gwt {
 
     # One arg: go to named worktree
     if [[ $# -eq 1 ]]; then
-        local target="$wt_dir/$1"
-        if [[ -d "$target" ]]; then
+        local target
+        target=$(_gwt_resolve_worktree_path "$1")
+        if [[ -n "$target" && -d "$target" ]]; then
             cd "$target"
         else
             echo "Error: Worktree '$1' not found."
-            echo "Expected: $target"
+            echo "Expected: $wt_dir/$1"
             echo ""
             echo "Available worktrees:"
             gwt-ls
@@ -547,11 +651,12 @@ function gwt-cd {
     fi
 
     local wt_dir=$(_gwt_worktrees_dir)
-    local target="$wt_dir/$1"
+    local target
+    target=$(_gwt_resolve_worktree_path "$1")
 
-    if [[ ! -d "$target" ]]; then
+    if [[ -z "$target" || ! -d "$target" ]]; then
         echo "Error: Worktree '$1' not found."
-        echo "Expected: $target"
+        echo "Expected: $wt_dir/$1"
         return 1
     fi
 
@@ -661,17 +766,28 @@ function gwt-rm {
         return 1
     fi
 
-    git -C "$main" worktree remove "$wt_dir/$name"
+    local target
+    target=$(_gwt_resolve_worktree_path "$name")
+    if [[ -z "$target" ]]; then
+        echo "Error: Worktree '$name' not found."
+        echo "Expected: $wt_dir/$name"
+        return 1
+    fi
 
-    # Clean up empty parent directories within the worktrees dir
-    local parent
-    parent=$(dirname "$wt_dir/$name")
-    while [[ "$parent" != "$wt_dir" && "$parent" != "$(dirname "$wt_dir")" ]]; do
-        rmdir "$parent" 2>/dev/null || break
-        parent=$(dirname "$parent")
-    done
-    # Clean up the project worktrees dir itself if empty
-    rmdir "$wt_dir" 2>/dev/null
+    git -C "$main" worktree remove "$target"
+
+    # Clean up empty parent directories within the worktrees dir when the
+    # removed worktree was in the canonical tree.
+    if [[ "$target" == "$wt_dir/"* ]]; then
+        local parent
+        parent=$(dirname "$target")
+        while [[ "$parent" != "$wt_dir" && "$parent" != "$(dirname "$wt_dir")" ]]; do
+            rmdir "$parent" 2>/dev/null || break
+            parent=$(dirname "$parent")
+        done
+        # Clean up the project worktrees dir itself if empty
+        rmdir "$wt_dir" 2>/dev/null
+    fi
 }
 
 # Prune stale worktree references
@@ -693,15 +809,7 @@ function _gwt_get_cur {
 
 function _gwt_complete_worktrees {
     local cur=$(_gwt_get_cur)
-    local main=$(_gwt_main_worktree)
-    [[ -z "$main" ]] && return
-    local wt_dir=$(_gwt_worktrees_dir)
-    # Use git worktree list to get actual worktree names (handles slashes in names)
-    local worktrees=$(git --no-pager -C "$main" worktree list --porcelain 2>/dev/null | \
-        grep --color=never "^worktree " | \
-        sed "s|^worktree ||" | \
-        sed "s|^$wt_dir/||" | \
-        grep --color=never -v "^/")
+    local worktrees=$(_gwt_list_worktree_names)
     COMPREPLY=($(compgen -W "$worktrees" -- "$cur"))
 }
 
